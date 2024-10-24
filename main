@@ -22,7 +22,6 @@ logging.basicConfig(level=logging.INFO,
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 定义数据增强和转换
 _transform = transforms.Compose([
     transforms.Resize((224, 224)),
     # transforms.RandomHorizontalFlip(),
@@ -128,7 +127,6 @@ class CustomViT(nn.Module):
 #set gama to be learnable and set the initial value as 2.0
         self.gamma = nn.Parameter(torch.tensor(2.0, device=device), requires_grad=True)
     def forward(self, x):
-        # 提取特征直到最后一层之前
         # print(self.original_model.head.weight.shape, self.mask_parameters.shape)
         # masked_weight = self.original_model.head.weight * self.mask_parameters
         x = self.original_model.forward_features(x)
