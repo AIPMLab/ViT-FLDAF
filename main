@@ -1,201 +1,395 @@
-import time, copy, logging, numpy as np
-from collections import Counter, defaultdict
+import numpy as np
 import torch
+import time
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, random_split
 from torchvision.datasets import ImageFolder
-from torchvision import transforms
+import torch.optim as optim
 import timm
+import copy
+import logging
 from sklearn.metrics import confusion_matrix
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s %(levelname)s %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S',
+                    handlers=[
+                        logging.FileHandler("./FedVit_efficient_logs/dataset4_log", mode='w'),
+                        logging.StreamHandler()
+                    ])
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ---------- data loaders (keep your original paths) ----------
+# 定义数据增强和转换
+_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    # transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
+    # transforms.RandomResizedCrop(224),
+    # transforms.RandomHorizontalFlip(),
     transforms.ToTensor(),
-    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
+
 Num_clients = 4
+# pathes = './data/RealSkin/client_'
+# pathes = './dataset/client_'
 pathes = './RCNA_ICH/client_'
-datasets = [ImageFolder(root=pathes+str(i), transform=transform) for i in range(Num_clients)]
-train_datasets = [datasets[i] for i in range(Num_clients-1)]
-test_dataset = datasets[Num_clients-1]
-train_loaders = [DataLoader(ds, batch_size=32, shuffle=True, drop_last=True) for ds in train_datasets]
-test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+client_weights = [float(1 / (Num_clients - 1)) for idx in range(0, Num_clients - 1)]
+# client_weights.append(0.2)
+# client_weights.append(0.5)
+# client_weights.append(0.3)
 
-num_classes = len(datasets[0].classes)  # adjust if necessary
+dataset = [ImageFolder(root=pathes + str(idx), transform=transform) for idx in range(0, Num_clients)]
+train_dataset = [dataset[idx] for idx in range(0, Num_clients - 1)]
+test_dataset = dataset[Num_clients - 1]
 
-# ---------- model with learnable gamma as in original ----------
+train_loader = [DataLoader(train_dataset[idx], batch_size=32, shuffle=True, drop_last=True) for idx in
+                range(0, Num_clients - 1)]
+
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, drop_last=True)
+
+
+# dataset.append(ImageFolder(root='./data/OfficeHome/Art', transform=transform))
+# dataset.append(ImageFolder(root='./data/OfficeHome/Product', transform=transform))
+# dataset.append(ImageFolder(root='./data/OfficeHome/RealWorld', transform=transform))e
+# dataset.append(ImageFolder(root='./data/BrainTumor/client_0', transform=transform))
+# dataset.append(ImageFolder(root='./data/BrainTumor/client_1', transform=transform))
+# dataset.append(ImageFolder(root='./data/BrainTumor/client_2', transform=transform))
+# dataset.append(ImageFolder(root='./data/BrainTumor/client_3', transform=_transform))
+# dataset.append(ImageFolder(root='./data/OfficeHome/Clipart', transform=transform))
+
+# dataset.append(ImageFolder(root='./dermnet/client_0', transform=transform))
+# dataset.append(ImageFolder(root='./dermnet/client_1', transform=transform))
+# dataset.append(ImageFolder(root='./dermnet/client_2', transform=transform))
+# dataset.append(ImageFolder(root='./dermnet/client_3', transform=_transform))
+
+# dataset.append(ImageFolder(root='./test/client_0', transform=transform))
+# dataset.append(ImageFolder(root='./test/client_1', transform=transform))
+# dataset.append(ImageFolder(root='./test/client_2', transform=transform))
+# dataset.append(ImageFolder(root='./test/client_3', transform=_transform))
+# dataset.append(ImageFolder(root='./RCNA_ICH/client_0', transform=transform))
+# dataset.append(ImageFolder(root='./RCNA_ICH/client_1', transform=transform))
+# dataset.append(ImageFolder(root='./RCNA_ICH/client_2', transform=transform))
+# dataset.append(ImageFolder(root='./RCNA_ICH/client_3', transform=_transform))
+# dataset.append(ImageFolder(root='./data/oral_cancer/client_0', transform=transform))
+# dataset.append(ImageFolder(root='./data/oral_cancer/client_1', transform=transform))
+# dataset.append(ImageFolder(root='./data/oral_cancer/client_2', transform=transform))
+# dataset.append(ImageFolder(root='./data/oral_cancer/client_3', transform=_transform))
+#
+# dataset.append(ImageFolder(root='./data/face_recognition/client_0', transform=transform))
+# dataset.append(ImageFolder(root='./data/face_recognition/client_1', transform=transform))
+# dataset.append(ImageFolder(root='./data/face_recognition/client_2', transform=transform))
+# dataset.append(ImageFolder(root='./data/face_recognition/client_3', transform=_transform))
+# dataset.append(ImageFolder(root='./dataset/client_0', transform=transform))
+# dataset.append(ImageFolder(root='./dataset/client_1', transform=transform))
+# dataset.append(ImageFolder(root='./dataset/client_2', transform=transform))
+# dataset.append(ImageFolder(root='./dataset/client_3', transform=_transform))
+# dataset.append(ImageFolder(root='./data/RealSkin/client_0', transform=transform))
+# dataset.append(ImageFolder(root='./data/RealSkin/client_1', transform=transform))
+# dataset.append(ImageFolder(root='./data/RealSkin/client_2', transform=transform))
+# dataset.append(ImageFolder(root='./data/RealSkin/client_3', transform=_transform))
+
+# dataset.append(ImageFolder(root='./differe05,025,015,01)/client_2', transform=transform))
+# dataset.append(ImageFolder(root='./different_distribution_dataset/RSNA-ICH(05,02nt_distribution_dataset/RSNA-ICH(05,025,015,01)/client_0', transform=transform))
+# dataset.append(ImageFolder(root='./different_distribution_dataset/RSNA-ICH(05,025,015,01)/client_1', transform=transform))
+# dataset.append(ImageFolder(root='./different_distribution_dataset/RSNA-ICH(5,015,01)//client_3', transform=_transform))
+
+# dataset.append(ImageFolder(root='./different_distribution_dataset/RSNA-ICH(03,03,02,01)/client_0', transform=transform))
+# dataset.append(ImageFolder(root='./different_distribution_dataset/RSNA-ICH(03,03,02,01)/client_1', transform=transform))
+# dataset.append(ImageFolder(root='./different_distribution_dataset/RSNA-ICH(03,03,02,01)/client_2', transform=transform))
+# dataset.append(ImageFolder(root='./different_distribution_dataset/RSNA-ICH(03,03,02,01)/client_3', transform=_transform))
+
+# dataset.append(ImageFolder(root='./different_distribution_dataset/ISIC(03,03,02,01)/client_0', transform=transform))
+# dataset.append(ImageFolder(root='./different_distribution_dataset/ISIC(03,03,02,01)/client_1', transform=transform))
+# dataset.append(ImageFolder(root='./different_distribution_dataset/ISIC(03,03,02,01)/client_2', transform=transform))
+# dataset.append(ImageFolder(root='./different_distribution_dataset/ISIC(03,03,02,01)/client_3', transform=_transform))
+# dataset.append(ImageFolder(root='./brain tumor dataset/client_0', transform=transform))
+# dataset.append(ImageFolder(root='./brain tumor dataset/client_1', transform=transform))
+# dataset.append(ImageFolder(root='./brain tumor dataset/client_2', transform=transform))
+# dataset.append(ImageFolder(root='./brain tumor dataset/client_3', transform=_transform))
+
+# dataset.append(ImageFolder(root='./data/BrainTumor/client_0', transform=transform))
+# dataset.append(ImageFolder(root='./data/BrainTumor/client_1', transform=transform))
+# dataset.append(ImageFolder(root='./data/BrainTumor/client_2', transform=transform))
+# dataset.append(ImageFolder(root='./data/BrainTumor/client_3', transform=_transform))
+#
+# dataset.append(ImageFolder(root='./comparison_datasets/Food2kTrain/client_0', transform=transform))
+# dataset.append(ImageFolder(root='./comparison_datasets/Food2kTrain/client_1', transform=transform))
+# dataset.append(ImageFolder(root='./comparison_datasets/Food2kTrain/client_2', transform=transform))
+# dataset.append(ImageFolder(root='./comparison_datasets/Food2kTrain/client_3', transform=_transform))
+
+
 class CustomViT(nn.Module):
     def __init__(self, num_classes):
-        super().__init__()
-        self.model = timm.create_model('vit_small_patch16_224', pretrained=True)
-        in_feat = self.model.head.in_features
-        self.model.head = nn.Linear(in_feat, num_classes)
-        self.gamma = nn.Parameter(torch.tensor(2.0, device=device), requires_grad=True)  # learnable gamma
+        super(CustomViT, self).__init__()
+        self.original_model = timm.create_model('vit_small_patch16_224', pretrained=True)
+        self.original_model.head = nn.Linear(self.original_model.head.in_features, num_classes)
+
+        # set gamma to be learnable and set the initial value as 2.0
+        self.gamma = nn.Parameter(torch.tensor(2.0, device=device), requires_grad=True)
 
     def forward(self, x):
-        return self.model(x)
+        x = self.original_model.forward_features(x)
+        x = self.original_model.norm(x)
+        y = self.original_model.head(x)
+        return y
 
-# ---------- imbalance/statistics utilities per 111.txt ----------
-eps = 1e-6
-def client_counts_from_dataset(dataset):
-    cnt = Counter()
-    for _, lbl in dataset:
-        cnt[int(lbl)] += 1
-    return dict(cnt)
 
-def compute_client_ck(client_count, num_classes):
-    N_k = sum(client_count.get(i,0) for i in range(num_classes))
-    vals = []
-    for i in range(num_classes):
-        nki = client_count.get(i,0) + 1e-6
-        vals.append((N_k - nki) / nki)
-    return float(sum(vals) / num_classes), N_k
+num_classes = 5
+glo_model = CustomViT(num_classes).to(device)
 
-def compute_global_class_cfi(all_client_counts, all_Nk, num_classes):
-    # c_{f,i} = (sum_k N_k - sum_k n_{k,i}) / sum_k n_{k,i}
-    sum_Nk = sum(all_Nk)
-    sum_nki = [0]*num_classes
-    for kcnt in all_client_counts:
-        for i in range(num_classes):
-            sum_nki[i] += kcnt.get(i,0)
-    cfi = []
-    # class weight W_i optional
-    for i in range(num_classes):
-        denom = sum_nki[i] + eps
-        cfi.append( (sum_Nk - sum_nki[i]) / denom )
-    return cfi, sum_nki
+models = [copy.deepcopy(glo_model) for _ in range(3)]
+for model in models:
+    model.to(device)
 
-# ---------- dynamic adaptive focal loss (per-sample, per-class scaling) ----------
-def dafl_loss(logits, labels, cfi_list, gamma_param, ce_weight=1.0):
-    """Implements: scaled focal per true-class: L = -(1 + c_{f,i}) * (1-pt)^gamma * log(pt)
-       plus optional CE to stabilize as in paper.
-    """
-    probs = torch.softmax(logits, dim=1)
-    batch = logits.shape[0]
-    labels_long = labels.long()
-    pt = probs[torch.arange(batch), labels_long].clamp(min=1e-9)
-    cf_per_sample = torch.tensor([cfi_list[int(l)] for l in labels_long.cpu().numpy()], device=logits.device, dtype=pt.dtype)
-    gamma = torch.clamp(gamma_param, min=0.0)
-    focal = -(1.0 + cf_per_sample) * (1.0 - pt) ** gamma * torch.log(pt)
-    focal_term = focal.mean()
-    ce = nn.CrossEntropyLoss()(logits, labels_long)
-    return focal_term + ce_weight * ce
 
-# ---------- aggregation weight from client ck ----------
-def aggregation_weights_from_ck(cks):
-    # w_k = 1 / (1 + c_k) to avoid zero/neg issues, then normalize
-    w = np.array([1.0 / (1.0 + max(0.0, ck) + eps) for ck in cks], dtype=float)
-    w = w / (w.sum() + 1e-12)
-    return w.tolist()
+def compute_imbalance_parameters(client_data, client_weights, num_classes):
+    # 1. Calculate Class-level Imbalance (c_{f,i}) - Eq 8
+    # Use only training clients for stats
+    num_train_clients = len(client_weights)
 
-# ---------- local training (receives class-level cfi for this round) ----------
-def local_train(model, train_loader, optimizer, scheduler, cfi_list, epochs=1):
+    total_samples_train = 0
+    train_class_counts = {cls: 0 for cls in range(num_classes)}
+
+    for k in range(num_train_clients):
+        counts = client_data[k]
+        total_samples_train += sum(counts.values())
+        for cls, count in counts.items():
+            train_class_counts[cls] += count
+
+    c_f_class = {}
+    for cls in range(num_classes):
+        n_i = train_class_counts[cls]
+        if n_i > 0:
+            c_f_class[cls] = (total_samples_train - n_i) / n_i
+        else:
+            c_f_class[cls] = 0.0
+
+    # 2. Calculate Client-level Imbalance (c_{f, client}) - Eq 14 & 7
+    c_f_client = 0.0
+    for k in range(num_train_clients):
+        counts = client_data[k]
+        N_k = sum(counts.values())
+
+        # Calculate c_k (Eq 7)
+        c_k_sum = 0.0
+        for cls in range(num_classes):
+            n_ki = counts.get(cls, 0)
+            # Avoid division by zero with small constant (e.g., 1)
+            n_ki_safe = max(n_ki, 1)
+            c_ki = (N_k - n_ki_safe) / n_ki_safe
+            c_k_sum += c_ki
+
+        c_k = c_k_sum / num_classes
+        c_f_client += client_weights[k] * c_k
+
+    return c_f_class, c_f_client
+
+
+def quality_aware_focal_loss(y_true, y_pred, gamma, cf):
+    # This function seems unused in the main training loop, but keeping it consistent if needed
+    pt = torch.where(y_true == 1, y_pred, 1 - y_pred)
+    focal_weight = (1 - pt) ** gamma
+    loss = - (1 + cf) * torch.log(pt + 1e-8) * focal_weight
+    return loss.mean()
+
+
+def custom_loss(outputs, labels, model, c_f_class, c_f_client, lambda_val=0.5, weight_decay=1e-5):
+    # DAFL: - (1 + c_{f,t}) * (1 - p_t)^gamma * log(p_t)
+    # c_{f,t} = lambda * c_{f,client} + (1-lambda) * c_{f,i}
+
+    probs = torch.nn.functional.softmax(outputs, dim=1)
+    gamma = model.gamma
+
+    # Get probabilities of the true classes (p_t)
+    pt = probs.gather(1, labels.view(-1, 1)).view(-1)
+
+    # Get class-level imbalance coefficients for the true classes
+    c_fi_batch = torch.tensor([c_f_class[l.item()] for l in labels], device=device)
+
+    # Combine with client-level imbalance using lambda
+    cfs = lambda_val * c_f_client + (1 - lambda_val) * c_fi_batch
+
+    # Calculate Dynamic Adaptive Focal Loss
+    focal_weight = (1 - pt) ** gamma
+    focal_loss = - (1 + cfs) * focal_weight * torch.log(pt + 1e-8)
+
+    total_loss = focal_loss.mean()
+
+    # L1 Regularization for model parameters (optional, kept from original structure if needed)
+    l1_regularization = torch.tensor(0., device=device)
+    for param in model.parameters():
+        if param.requires_grad:
+            l1_regularization += torch.norm(param, 1)
+
+    total_loss += (weight_decay * l1_regularization) * 0.1
+
+    return total_loss
+
+
+def train(model, train_loader, optimizer, scheduler, c_f_class, c_f_client, lambda_val, epochs=50):
     model.train()
-    for e in range(epochs):
-        total_loss = 0.0
-        for imgs, labels in train_loader:
-            imgs, labels = imgs.to(device), labels.to(device)
+    for epoch in range(epochs):
+        total_loss = 0
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
-            logits = model(imgs)
-            loss = dafl_loss(logits, labels, cfi_list, model.gamma)
+            outputs = model(inputs)
+            loss = custom_loss(outputs, labels, model, c_f_class, c_f_client, lambda_val)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        if scheduler is not None:
-            scheduler.step()
-        logging.info(f"Local epoch {e+1}/{epochs} loss {total_loss/len(train_loader):.4f}")
+
+        # 在每个epoch结束时更新学习率
+        scheduler.step()
+
+        avg_loss = total_loss / len(train_loader)
+        logging.info(f"Epoch {epoch + 1}/{epochs}, Average Loss: {avg_loss:.4f}")
     return model
 
-# ---------- server aggregation ----------
-def federated_aggregate(server_model, client_models, agg_weights):
-    server_sd = server_model.state_dict()
-    # initialize server params as zeros
-    new_state = {k: torch.zeros_like(v, dtype=torch.float32) for k,v in server_sd.items()}
-    for w, cm in zip(agg_weights, client_models):
-        csd = cm.state_dict()
-        for k in new_state:
-            new_state[k] += w * csd[k].to(torch.float32)
-    server_model.load_state_dict(new_state)
-    # broadcast back
-    for cm in client_models:
-        cm.load_state_dict(server_model.state_dict())
-    return server_model, client_models
 
-# ---------- orchestration ----------
-def run_federated(rounds=50, local_epochs=1):
-    # init models, optimizers, schedulers
-    server_model = CustomViT(num_classes).to(device)
-    client_models = [copy.deepcopy(server_model).to(device) for _ in range(len(train_loaders))]
-    opts = [optim.Adam(cm.parameters(), lr=1e-4) for cm in client_models]
-    scheds = [torch.optim.lr_scheduler.StepLR(opt, step_size=30, gamma=0.1) for opt in opts]
+# 确保在初始化学习率调度器之前初始化优化器
+optimizers = [optim.Adam(params=[{'params': models[idx].parameters()}], lr=1e-3, betas=(0.9, 0.98), eps=1e-6) for idx in
+              range(3)]
+schedulers = [copy.deepcopy(torch.optim.lr_scheduler.StepLR(optimizers[idx], step_size=30, gamma=0.1)) for idx in
+              range(3)]
 
-    # initial client counts (clients compute locally and send counts each round)
-    client_counts = [client_counts_from_dataset(ds) for ds in train_datasets]
-    all_Nk = [sum(cnt.values()) for cnt in client_counts]
-    # initial compute (server)
-    cks = []
-    for cnt in client_counts:
-        ck, Nk = compute_client_ck(cnt, num_classes)
-        cks.append(ck)
-    cfi_list, _ = compute_global_class_cfi(client_counts, all_Nk, num_classes)
 
-    best_acc = 0.0
-    for r in range(rounds):
-        logging.info(f"--- Round {r+1}/{rounds} ---")
-        # clients receive cfi_list and train locally
-        for i in range(len(client_models)):
-            client_models[i] = local_train(client_models[i], train_loaders[i], opts[i], scheds[i], cfi_list, epochs=local_epochs)
-
-        # after local training, clients recompute and send counts (simulate)
-        client_counts = [client_counts_from_dataset(ds) for ds in train_datasets]
-        all_Nk = [sum(cnt.values()) for cnt in client_counts]
-        # server computes client c_k and class-level cfi
-        cks = []
-        for cnt in client_counts:
-            ck, Nk = compute_client_ck(cnt, num_classes)
-            cks.append(ck)
-        cfi_list, sum_nki = compute_global_class_cfi(client_counts, all_Nk, num_classes)
-
-        # compute aggregation weights from cks
-        agg_w = aggregation_weights_from_ck(cks)
-        logging.info(f"Aggregation weights: {agg_w}")
-
-        # aggregate
-        server_model, client_models = federated_aggregate(server_model, client_models, agg_w)
-
-        # eval
-        acc, cm = evaluate(server_model, test_loader)
-        if acc > best_acc:
-            best_acc = acc
-            torch.save(server_model.state_dict(), 'models/best_dafl.pth')
-            logging.info(f"New best {best_acc:.2f}% saved.")
-
-    logging.info("Federated training finished.")
-
-def evaluate(model, loader):
+def evaluate(model, test_loader):
     model.eval()
     correct = 0
     total = 0
-    preds = []
-    labels = []
+    all_predicted = []
+    all_labels = []
     with torch.no_grad():
-        for imgs, lbs in loader:
-            imgs = imgs.to(device); lbs = lbs.to(device)
-            logits = model(imgs)
-            _, p = torch.max(logits, dim=1)
-            correct += (p == lbs).sum().item()
-            total += lbs.size(0)
-            preds.extend(p.cpu().numpy()); labels.extend(lbs.cpu().numpy())
-    acc = 100.0 * correct / total if total>0 else 0.0
-    logging.info(f"Eval acc: {acc:.2f}%")
-    logging.info("Confusion matrix:\n" + str(confusion_matrix(labels, preds)))
-    return acc, confusion_matrix(labels, preds)
+        for inputs, labels in test_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            all_predicted.extend(predicted.view(-1).cpu().numpy())
+            all_labels.extend(labels.view(-1).cpu().numpy())
 
-if __name__ == "__main__":
-    run_federated(rounds=50, local_epochs=1)
+    accuracy = correct / total * 100
+    logging.info(f'Accuracy on test set: {accuracy:.2f}%')
+
+    cm = confusion_matrix(all_labels, all_predicted)
+    logging.info(f'Confusion Matrix:\n{cm}')
+    # print(model.mask_parameters)
+    return accuracy, cm
+
+
+available_models = timm.list_models(pretrained=True)
+
+
+# print(available_models)
+
+
+def LocalTraining(models, train_loader, c_f_class, c_f_client, lambda_val):
+    model_new = []
+    for i, model in enumerate(models):
+        logging.info('Client: %s Local Training', i)
+        model_new.append(
+            train(model, train_loader[i], optimizers[i], schedulers[i], c_f_class, c_f_client, lambda_val, epochs=1))
+    return model_new
+
+
+def communication(server_model, models, client_weights):
+    client_num = len(models)
+    with torch.no_grad():
+        for key in server_model.state_dict().keys():
+            temp = torch.zeros_like(server_model.state_dict()[key], dtype=torch.float64)
+            for client_idx in range(client_num):
+                temp += client_weights[client_idx] * models[client_idx].state_dict()[key]
+
+            server_model.state_dict()[key].data.copy_(temp)
+            for client_idx in range(client_num):
+                models[client_idx].state_dict()[key].data.copy_(server_model.state_dict()[key])
+
+    return server_model, models
+
+
+def FederatedTraining(models, glo_model, train_loader, c_f_class, c_f_client, lambda_val):
+    start_time = time.time()
+
+    results = []
+    best_accuracy = 0
+    for i in range(0, 50):
+        models = LocalTraining(models, train_loader, c_f_class, c_f_client, lambda_val)
+        logging.info('Started Communication!')
+        glo_model, models = communication(glo_model, models, client_weights)
+        logging.info('Started Evaluation')
+        acc, cm = evaluate(glo_model, test_loader)
+        results.append([acc])
+        print(acc)
+        if acc > best_accuracy:
+            best_accuracy = acc
+            model_save_path = 'models/DFL_lr_1e-3_RSNA.pth'
+            torch.save(glo_model.state_dict(), model_save_path)
+            logging.info(f"New best model with accuracy: {best_accuracy:.2f}% saved to {model_save_path}")
+
+    end_time = time.time()
+    total_time = end_time - start_time
+    logging.info(f"Total training time: {total_time // 3600}h {(total_time % 3600) // 60}m {total_time % 60:.2f}s")
+
+    save_results = np.array(results, dtype=float)
+    np.savetxt('logs/DFL_lr_1e-3 _RSNA', save_results, delimiter=',', fmt='%.6f')
+
+    return results, cm
+
+
+#
+def get_client_data_stats(dataset):
+    """动态生成每个客户端的数据样本数"""
+    client_data = []
+    for client_dataset in dataset:
+        class_counts = {}
+        # Use .targets if available for faster counting
+        if hasattr(client_dataset, 'targets'):
+            targets = client_dataset.targets
+            # If targets is a list, we can iterate. If it's a tensor, we can use bincount (if numeric)
+            # Assuming standard ImageFolder list of ints
+            for label in targets:
+                # Handle potential tensor wrapper
+                if isinstance(label, torch.Tensor):
+                    label = label.item()
+                if label not in class_counts:
+                    class_counts[label] = 0
+                class_counts[label] += 1
+        else:
+            for _, label in client_dataset:
+                if label not in class_counts:
+                    class_counts[label] = 0
+                class_counts[label] += 1
+        client_data.append(class_counts)
+    return client_data
+
+
+# 动态生成client_data
+client_data = get_client_data_stats(dataset)
+
+# Calculate client weights based on data size (Weighted Aggregation Strategy)
+# Only for the training clients (0 to Num_clients-2)
+train_client_data = client_data[:Num_clients - 1]
+total_train_samples = sum(sum(c.values()) for c in train_client_data)
+client_weights = [sum(c.values()) / total_train_samples for c in train_client_data]
+logging.info(f"Calculated client weights: {client_weights}")
+
+c_f_class, c_f_client = compute_imbalance_parameters(client_data, client_weights, num_classes)
+
+# Set lambda parameter (balancing coefficient)
+lambda_val = 0.5
+
+results, cm = FederatedTraining(models, glo_model, train_loader, c_f_class, c_f_client, lambda_val)
+model_save_path = 'saved_models'
+
+torch.save(glo_model.state_dict(), model_save_path)
