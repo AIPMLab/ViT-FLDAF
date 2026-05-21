@@ -9,8 +9,13 @@ import torch.optim as optim
 import timm
 import copy
 import logging
+import os
 from sklearn.metrics import confusion_matrix
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+os.makedirs("./FedVit_efficient_logs", exist_ok=True)
+os.makedirs("./models", exist_ok=True)
+os.makedirs("./logs", exist_ok=True)
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s',
@@ -21,6 +26,7 @@ logging.basicConfig(level=logging.INFO,
                     ])
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+EPS = 1e-6
 
 # 定义数据增强和转换
 _transform = transforms.Compose([
@@ -51,10 +57,10 @@ dataset = [ImageFolder(root=pathes + str(idx), transform=transform) for idx in r
 train_dataset = [dataset[idx] for idx in range(0, Num_clients - 1)]
 test_dataset = dataset[Num_clients - 1]
 
-train_loader = [DataLoader(train_dataset[idx], batch_size=32, shuffle=True, drop_last=True) for idx in
+train_loader = [DataLoader(train_dataset[idx], batch_size=16, shuffle=True, drop_last=True) for idx in
                 range(0, Num_clients - 1)]
 
-test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, drop_last=True)
+test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, drop_last=True)
 
 
 # dataset.append(ImageFolder(root='./data/OfficeHome/Art', transform=transform))
@@ -133,28 +139,23 @@ class CustomViT(nn.Module):
         self.original_model = timm.create_model('vit_small_patch16_224', pretrained=True)
         self.original_model.head = nn.Linear(self.original_model.head.in_features, num_classes)
 
-        # set gamma to be learnable and set the initial value as 2.0
-        self.gamma = nn.Parameter(torch.tensor(2.0, device=device), requires_grad=True)
+        # Focal-loss focusing parameter gamma is a fixed hyperparameter in the paper.
+        self.register_buffer("gamma", torch.tensor(2.0))
 
     def forward(self, x):
-        x = self.original_model.forward_features(x)
-        x = self.original_model.norm(x)
-        y = self.original_model.head(x)
-        return y
+        return self.original_model(x)
 
 
 num_classes = 5
 glo_model = CustomViT(num_classes).to(device)
 
-models = [copy.deepcopy(glo_model) for _ in range(3)]
+models = [copy.deepcopy(glo_model) for _ in range(Num_clients - 1)]
 for model in models:
     model.to(device)
 
 
-def compute_imbalance_parameters(client_data, client_weights, num_classes):
-    # 1. Calculate Class-level Imbalance (c_{f,i}) - Eq 8
-    # Use only training clients for stats
-    num_train_clients = len(client_weights)
+def compute_imbalance_parameters(client_data, num_train_clients, num_classes, eps=EPS):
+    # Eq. (class_imbalance): class-level global rarity c_{f,i}.
 
     total_samples_train = 0
     train_class_counts = {cls: 0 for cls in range(num_classes)}
@@ -168,13 +169,10 @@ def compute_imbalance_parameters(client_data, client_weights, num_classes):
     c_f_class = {}
     for cls in range(num_classes):
         n_i = train_class_counts[cls]
-        if n_i > 0:
-            c_f_class[cls] = (total_samples_train - n_i) / n_i
-        else:
-            c_f_class[cls] = 0.0
+        c_f_class[cls] = (total_samples_train - n_i) / (n_i + eps)
 
-    # 2. Calculate Client-level Imbalance (c_{f, client}) - Eq 14 & 7
-    c_f_client = 0.0
+    # Eq. (client_imbalance): keep c_k for each client, not a weighted global average.
+    client_imbalances = []
     for k in range(num_train_clients):
         counts = client_data[k]
         N_k = sum(counts.values())
@@ -183,15 +181,18 @@ def compute_imbalance_parameters(client_data, client_weights, num_classes):
         c_k_sum = 0.0
         for cls in range(num_classes):
             n_ki = counts.get(cls, 0)
-            # Avoid division by zero with small constant (e.g., 1)
-            n_ki_safe = max(n_ki, 1)
-            c_ki = (N_k - n_ki_safe) / n_ki_safe
+            c_ki = (N_k - n_ki) / (n_ki + eps)
             c_k_sum += c_ki
 
         c_k = c_k_sum / num_classes
-        c_f_client += client_weights[k] * c_k
+        client_imbalances.append(c_k)
 
-    return c_f_class, c_f_client
+    # Eq. (wk)-(omega): client-aware aggregation weights.
+    raw_weights = [1.0 / (c_k + eps) for c_k in client_imbalances]
+    raw_weight_sum = sum(raw_weights)
+    aggregation_weights = [w / raw_weight_sum for w in raw_weights]
+
+    return c_f_class, client_imbalances, aggregation_weights
 
 
 def quality_aware_focal_loss(y_true, y_pred, gamma, cf):
@@ -202,9 +203,9 @@ def quality_aware_focal_loss(y_true, y_pred, gamma, cf):
     return loss.mean()
 
 
-def custom_loss(outputs, labels, model, c_f_class, c_f_client, lambda_val=0.5, weight_decay=1e-5):
+def custom_loss(outputs, labels, model, c_f_class, client_imbalance, lambda_val=0.5, weight_decay=1e-5):
     # DAFL: - (1 + c_{f,t}) * (1 - p_t)^gamma * log(p_t)
-    # c_{f,t} = lambda * c_{f,client} + (1-lambda) * c_{f,i}
+    # c_{f,t} = lambda * c_k + (1-lambda) * c_{f,i}
 
     probs = torch.nn.functional.softmax(outputs, dim=1)
     gamma = model.gamma
@@ -215,8 +216,8 @@ def custom_loss(outputs, labels, model, c_f_class, c_f_client, lambda_val=0.5, w
     # Get class-level imbalance coefficients for the true classes
     c_fi_batch = torch.tensor([c_f_class[l.item()] for l in labels], device=device)
 
-    # Combine with client-level imbalance using lambda
-    cfs = lambda_val * c_f_client + (1 - lambda_val) * c_fi_batch
+    # Combine the current client's c_k with the true class global rarity.
+    cfs = lambda_val * client_imbalance + (1 - lambda_val) * c_fi_batch
 
     # Calculate Dynamic Adaptive Focal Loss
     focal_weight = (1 - pt) ** gamma
@@ -235,7 +236,7 @@ def custom_loss(outputs, labels, model, c_f_class, c_f_client, lambda_val=0.5, w
     return total_loss
 
 
-def train(model, train_loader, optimizer, scheduler, c_f_class, c_f_client, lambda_val, epochs=50):
+def train(model, train_loader, optimizer, scheduler, c_f_class, client_imbalance, lambda_val, epochs=50):
     model.train()
     for epoch in range(epochs):
         total_loss = 0
@@ -243,7 +244,7 @@ def train(model, train_loader, optimizer, scheduler, c_f_class, c_f_client, lamb
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)
-            loss = custom_loss(outputs, labels, model, c_f_class, c_f_client, lambda_val)
+            loss = custom_loss(outputs, labels, model, c_f_class, client_imbalance, lambda_val)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -257,10 +258,10 @@ def train(model, train_loader, optimizer, scheduler, c_f_class, c_f_client, lamb
 
 
 # 确保在初始化学习率调度器之前初始化优化器
-optimizers = [optim.Adam(params=[{'params': models[idx].parameters()}], lr=1e-3, betas=(0.9, 0.98), eps=1e-6) for idx in
-              range(3)]
+optimizers = [optim.Adam(params=[{'params': models[idx].parameters()}], lr=1e-4, betas=(0.9, 0.98), eps=1e-6) for idx in
+              range(Num_clients - 1)]
 schedulers = [copy.deepcopy(torch.optim.lr_scheduler.StepLR(optimizers[idx], step_size=30, gamma=0.1)) for idx in
-              range(3)]
+              range(Num_clients - 1)]
 
 
 def evaluate(model, test_loader):
@@ -294,12 +295,12 @@ available_models = timm.list_models(pretrained=True)
 # print(available_models)
 
 
-def LocalTraining(models, train_loader, c_f_class, c_f_client, lambda_val):
+def LocalTraining(models, train_loader, c_f_class, client_imbalances, lambda_val):
     model_new = []
     for i, model in enumerate(models):
         logging.info('Client: %s Local Training', i)
         model_new.append(
-            train(model, train_loader[i], optimizers[i], schedulers[i], c_f_class, c_f_client, lambda_val, epochs=1))
+            train(model, train_loader[i], optimizers[i], schedulers[i], c_f_class, client_imbalances[i], lambda_val, epochs=1))
     return model_new
 
 
@@ -318,22 +319,22 @@ def communication(server_model, models, client_weights):
     return server_model, models
 
 
-def FederatedTraining(models, glo_model, train_loader, c_f_class, c_f_client, lambda_val):
+def FederatedTraining(models, glo_model, train_loader, c_f_class, client_imbalances, aggregation_weights, lambda_val):
     start_time = time.time()
 
     results = []
     best_accuracy = 0
     for i in range(0, 50):
-        models = LocalTraining(models, train_loader, c_f_class, c_f_client, lambda_val)
+        models = LocalTraining(models, train_loader, c_f_class, client_imbalances, lambda_val)
         logging.info('Started Communication!')
-        glo_model, models = communication(glo_model, models, client_weights)
+        glo_model, models = communication(glo_model, models, aggregation_weights)
         logging.info('Started Evaluation')
         acc, cm = evaluate(glo_model, test_loader)
         results.append([acc])
         print(acc)
         if acc > best_accuracy:
             best_accuracy = acc
-            model_save_path = 'models/DFL_lr_1e-3_RSNA.pth'
+            model_save_path = 'models/DFL_lr_1e-4_RSNA.pth'
             torch.save(glo_model.state_dict(), model_save_path)
             logging.info(f"New best model with accuracy: {best_accuracy:.2f}% saved to {model_save_path}")
 
@@ -342,7 +343,7 @@ def FederatedTraining(models, glo_model, train_loader, c_f_class, c_f_client, la
     logging.info(f"Total training time: {total_time // 3600}h {(total_time % 3600) // 60}m {total_time % 60:.2f}s")
 
     save_results = np.array(results, dtype=float)
-    np.savetxt('logs/DFL_lr_1e-3 _RSNA', save_results, delimiter=',', fmt='%.6f')
+    np.savetxt('logs/DFL_lr_1e-4_RSNA', save_results, delimiter=',', fmt='%.6f')
 
     return results, cm
 
@@ -377,19 +378,18 @@ def get_client_data_stats(dataset):
 # 动态生成client_data
 client_data = get_client_data_stats(dataset)
 
-# Calculate client weights based on data size (Weighted Aggregation Strategy)
-# Only for the training clients (0 to Num_clients-2)
-train_client_data = client_data[:Num_clients - 1]
-total_train_samples = sum(sum(c.values()) for c in train_client_data)
-client_weights = [sum(c.values()) / total_train_samples for c in train_client_data]
-logging.info(f"Calculated client weights: {client_weights}")
+# Calculate DAFL statistics and client-aware aggregation weights from training clients.
+c_f_class, client_imbalances, client_weights = compute_imbalance_parameters(
+    client_data, Num_clients - 1, num_classes
+)
+logging.info(f"Client imbalance coefficients c_k: {client_imbalances}")
+logging.info(f"Client-aware aggregation weights omega_k: {client_weights}")
 
-c_f_class, c_f_client = compute_imbalance_parameters(client_data, client_weights, num_classes)
 
 # Set lambda parameter (balancing coefficient)
 lambda_val = 0.5
 
-results, cm = FederatedTraining(models, glo_model, train_loader, c_f_class, c_f_client, lambda_val)
+results, cm = FederatedTraining(models, glo_model, train_loader, c_f_class, client_imbalances, client_weights, lambda_val)
 model_save_path = 'saved_models'
 
 torch.save(glo_model.state_dict(), model_save_path)
